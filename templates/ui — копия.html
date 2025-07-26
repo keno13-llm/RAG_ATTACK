@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>RAG Attack Demo</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; }
+        h1, h2, h3 { color: #1a4b6d; }
+        .result { background: #f6f6ff; border: 1px solid #cbe2fd; padding: 1em; border-radius: 8px; margin-bottom: 2em; }
+        pre { background: #fff; padding: 0.5em; border-radius: 4px; border: 1px solid #eee; white-space: pre-wrap; word-break: break-word; }
+        label { display: block; margin: 1em 0 0.2em 0; }
+        #query-demo h3 { margin-top: 1.5em; }
+        mark { background: #fdffb4; }
+        .flag-ok { color: #4ca844; }
+        .flag-bad { color: #d14; }
+    </style>
+</head>
+<body>
+    <h1>RAG Attack Demo</h1>
+
+    <!-- Форма загрузки документов -->
+    <h2>Загрузить новый документ</h2>
+    <form id="upload-form" enctype="multipart/form-data">
+        <input type="file" id="file" name="file" accept=".pdf,.docx,.txt,.text">
+        <button type="submit">Загрузить</button>
+    </form>
+    <div id="upload-result" class="result" style="display:none"></div>
+
+    <!-- Форма запроса -->
+    <form id="query-form">
+        <label for="query">Ваш запрос:</label>
+        <input type="text" id="query" name="query" size="60" required autofocus>
+
+        <label for="attack">Тип атаки:</label>
+        <select id="attack" name="attack">
+            <option value="none">— Нет —</option>
+            <option value="jailbreak">Jailbreak</option>
+            <option value="leak">Leak</option>
+        </select>
+
+        <label for="defense">Тип защиты:</label>
+        <select id="defense" name="defense">
+            <option value="none">— Нет —</option>
+            <option value="isolation">Контекстная изоляция</option>
+            <option value="filter">Словарный фильтр</option>
+            <option value="sanitize">Контентный sanity-check</option>
+        </select>
+
+        <label for="doc-id">Документ (ID, опционально):</label>
+        <input type="number" id="doc-id" name="doc_id" min="0" placeholder="оставьте пустым для поиска по всем">
+
+        <button type="submit">Отправить</button>
+    </form>
+
+    <div id="query-result" class="result" style="display:none"></div>
+
+    <div id="query-demo" class="result" style="display:none">
+        <h2>Демонстрация работы фильтров и защиты</h2>
+
+        <h3>1. Исходный контекст</h3>
+        <pre id="raw-context"></pre>
+
+        <h3>2. После контекстной изоляции</h3>
+        <pre id="isolated-context"></pre>
+
+        <h3>3. Ответ LLM (до фильтрации/санитизации)</h3>
+        <pre id="answer-raw"></pre>
+
+        <h3>4. После словарного фильтра</h3>
+        <pre id="answer-filtered"></pre>
+
+        <h3>5. После контентного sanity-check</h3>
+        <pre id="answer-sanitized"></pre>
+
+        <h3>6. Флаги sanity-check</h3>
+        <ul id="flags-list"></ul>
+
+        <h3>7. Найдено вредоносных паттернов</h3>
+        <p>Точное совпадение: <span id="found-exact"></span></p>
+        <p>Нечёткое совпадение: <span id="found-fuzzy"></span></p>
+    </div>
+
+    <script>
+    // Форма загрузки
+    document.getElementById('upload-form').onsubmit = async function(e) {
+        e.preventDefault();
+        const fileInput = document.getElementById('file');
+        if (!fileInput.files.length) return;
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        const resp = await fetch('/upload', {
+            method: 'POST',
+            body: formData
+        });
+        const uploadDiv = document.getElementById('upload-result');
+        if (!resp.ok) {
+            uploadDiv.innerText = 'Ошибка загрузки: ' + resp.status;
+            uploadDiv.style.display = '';
+            return;
+        }
+        const data = await resp.json();
+        uploadDiv.innerText = 'Документ загружен! ID: ' + data.doc_id + ', символов: ' + data.size;
+        uploadDiv.style.display = '';
+    };
+
+    // Форма запроса
+    const form = document.getElementById('query-form');
+    form.onsubmit = async function(e) {
+        e.preventDefault();
+        document.getElementById('query-result').style.display = 'none';
+        document.getElementById('query-demo').style.display = 'none';
+
+        const query = document.getElementById('query').value;
+        const attack = document.getElementById('attack').value;
+        const defense = document.getElementById('defense').value;
+        const docIdVal = document.getElementById('doc-id').value;
+        const doc_id = docIdVal !== "" ? Number(docIdVal) : null;
+
+        const payload = {
+            prompt: query,
+            defense: defense,
+            attack: attack,
+            doc_id: doc_id
+        };
+
+        // Запрос к FastAPI
+        const resp = await fetch('/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+            document.getElementById('query-result').innerText = 'Ошибка: ' + resp.status;
+            document.getElementById('query-result').style.display = '';
+            return;
+        }
+
+        const data = await resp.json();
+        // Основной вывод ответа
+        let mainText = "<strong>Ответ:</strong><br>";
+        if (data.answer_filtered) mainText += `<pre>${highlightPatterns(data.answer_filtered, data.found_exact, data.found_fuzzy)}</pre>`;
+        else if (data.answer_sanitized) mainText += `<pre>${escapeHTML(data.answer_sanitized)}</pre>`;
+        else if (data.answer_raw) mainText += `<pre>${escapeHTML(data.answer_raw)}</pre>`;
+        else mainText += "<pre><em>Пусто</em></pre>";
+
+        document.getElementById('query-result').innerHTML = mainText;
+        document.getElementById('query-result').style.display = '';
+
+        // Пошаговая демонстрация
+        document.getElementById('raw-context').textContent      = data.raw_context || '—';
+        document.getElementById('isolated-context').textContent = data.isolated_context || '—';
+        document.getElementById('answer-raw').textContent       = data.answer_raw || '—';
+        document.getElementById('answer-filtered').innerHTML    = data.answer_filtered
+            ? highlightPatterns(data.answer_filtered, data.found_exact, data.found_fuzzy)
+            : '—';
+        document.getElementById('answer-sanitized').textContent = data.answer_sanitized || '—';
+
+        // Флаги
+        const flagsEl = document.getElementById('flags-list');
+        flagsEl.innerHTML = '';
+        if (data.flags && Object.keys(data.flags).length) {
+            for (const [key, val] of Object.entries(data.flags)) {
+                const li = document.createElement('li');
+                li.textContent = `${key}: ${val}`;
+                li.className = (val === true || val === 'ok') ? 'flag-ok' : (val ? 'flag-bad' : '');
+                flagsEl.appendChild(li);
+            }
+        } else {
+            const li = document.createElement('li');
+            li.textContent = '—';
+            flagsEl.appendChild(li);
+        }
+
+        document.getElementById('found-exact').textContent = (data.found_exact && data.found_exact.length)
+            ? data.found_exact.join(', ')
+            : '—';
+        document.getElementById('found-fuzzy').textContent = (data.found_fuzzy && data.found_fuzzy.length)
+            ? data.found_fuzzy.join(', ')
+            : '—';
+
+        document.getElementById('query-demo').style.display = '';
+    };
+
+    // Вспомогательные функции
+    function escapeHTML(str) {
+        if (!str) return '';
+        return str.replace(/[<>&"]/g, function(c) {
+            return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];
+        });
+    }
+    // Подсвечиваем вредоносные паттерны (точные и нечёткие)
+    function highlightPatterns(text, exact, fuzzy) {
+        if (!text) return '';
+        let safe = escapeHTML(text);
+        let allPatterns = [].concat(exact||[], fuzzy||[]);
+        allPatterns = Array.from(new Set(allPatterns)).sort((a,b) => b.length - a.length); // длинные вперёд
+        for (const pat of allPatterns) {
+            if (!pat) continue;
+            const re = new RegExp(escapeRegExp(pat), 'gi');
+            safe = safe.replace(re, m => `<mark>${m}</mark>`);
+        }
+        return safe;
+    }
+    function escapeRegExp(string) {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    </script>
+</body>
+</html>

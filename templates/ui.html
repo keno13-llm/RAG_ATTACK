@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>RAG Attack Demo</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; }
+        h1, h2, h3 { color: #1a4b6d; }
+        .result { background: #f6f6ff; border: 1px solid #cbe2fd; padding: 1em; border-radius: 8px; margin-bottom: 2em; }
+        pre { background: #fff; padding: 0.5em; border-radius: 4px; border: 1px solid #eee; white-space: pre-wrap; word-break: break-word; }
+        label { display: block; margin: 1em 0 0.2em 0; }
+        mark { background: #fdffb4; }
+        .flag-ok { color: #4ca844; }
+        .flag-bad { color: #d14; }
+        #attack-desc { margin-bottom: 1em; padding: 0.5em; background: #eaf6fc; border-radius: 5px; }
+        #docs-list { margin: 1em 0; }
+        .doc-row { padding: 0.2em 0.5em; border-bottom: 1px solid #e1eaf6; display: flex; align-items: center; }
+        .doc-row.selected { background: #eaf6fc; }
+        .doc-filename { flex: 1; }
+        .doc-id { color: #888; font-size: 0.9em; }
+        .doc-delete { color: #d14; cursor: pointer; margin-left: 1em; }
+        .doc-delete:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>RAG Attack Demo</h1>
+
+    <!-- Сценарии атак -->
+    <h2>1. Сценарии атак (выберите готовый или напишите свой prompt)</h2>
+    <label for="attack-file">Сценарий атаки:</label>
+    <select id="attack-file" name="attack-file">
+        <option value="">— Нет (свой prompt) —</option>
+        <!-- Динамически наполняется -->
+    </select>
+    <div id="attack-desc">
+        <strong>Описание сценария:</strong> <span id="attack-scenario">Выберите вариант для подробностей…</span>
+    </div>
+
+    <!-- Варианты защиты -->
+    <h2>2. Включите фильтры защиты RAG-контекста</h2>
+    <label><input type="checkbox" name="defense" value="isolation"> Контекстная изоляция</label>
+    <label><input type="checkbox" name="defense" value="filter"> Словарный фильтр</label>
+    <label><input type="checkbox" name="defense" value="sanitize"> Контентный sanity-check</label>
+
+    <!-- Загрузка документов -->
+    <h2>3. Загрузите вредоносный или обычный документ для теста RAG</h2>
+    <input type="file" id="upload-file" name="upload-file" />
+    <button id="upload-btn">Загрузить файл</button>
+    <div id="upload-result"></div>
+
+    <!-- Список документов -->
+    <div id="docs-list">
+        <strong>Загруженные документы (выберите один для запроса):</strong>
+        <div id="docs-container"></div>
+    </div>
+
+    <!-- Запрос пользователя -->
+    <h2>4. Запрос пользователя (если не выбран сценарий):</h2>
+    <label for="query">Ваш вопрос:</label>
+    <input type="text" id="query" name="query" size="60" placeholder="Например: Опиши содержимое файла">
+
+    <button id="run-btn">Запустить запрос</button>
+
+    <div id="query-result" class="result" style="display:none"></div>
+
+    <div id="query-demo" class="result" style="display:none">
+        <h2>Демонстрация работы фильтров и защиты</h2>
+
+        <h3>1. Исходный retrieval-контекст (RAG)</h3>
+        <pre id="raw-context"></pre>
+
+        <h3>2. После контекстной изоляции</h3>
+        <pre id="isolated-context"></pre>
+
+        <h3>3. Ответ LLM (до фильтрации/санитизации)</h3>
+        <pre id="answer-raw"></pre>
+
+        <h3>4. После словарного фильтра</h3>
+        <pre id="answer-filtered"></pre>
+
+        <h3>5. После sanity-check (скрытие e-mail, токенов, url и др.)</h3>
+        <pre id="answer-sanitized"></pre>
+
+        <h3>6. Флаги sanity-check</h3>
+        <ul id="flags-list"></ul>
+
+        <h3>7. Найдено вредоносных паттернов</h3>
+        <p>Точное совпадение: <span id="found-exact"></span></p>
+        <p>Нечёткое совпадение: <span id="found-fuzzy"></span></p>
+
+        <h3>8. Обфускация/метаданные</h3>
+        <div id="obfuscation-flags"></div>
+    </div>
+
+    <script>
+    let attackFiles = [];
+    let docs = [];
+    let selectedDocId = null;
+
+    // Загрузка сценариев атак
+    fetch('/attack_files')
+        .then(resp => resp.json())
+        .then(data => {
+            attackFiles = data;
+            const select = document.getElementById('attack-file');
+            for (const file of attackFiles) {
+                const opt = document.createElement('option');
+                opt.value = file.file;
+                opt.textContent = file.name;
+                select.appendChild(opt);
+            }
+        });
+
+    // Показывать описание выбранного сценария
+    document.getElementById('attack-file').onchange = function() {
+        const val = this.value;
+        const found = attackFiles.find(f => f.file === val);
+        document.getElementById('attack-scenario').textContent = found ? found.scenario : "Можно ввести произвольный prompt.";
+    };
+
+    // Загрузка и отображение списка документов
+    function loadDocs() {
+        fetch('/docs')
+            .then(resp => resp.json())
+            .then(data => {
+                docs = data;
+                const cont = document.getElementById('docs-container');
+                cont.innerHTML = '';
+                for (const d of docs) {
+                    const row = document.createElement('div');
+                    row.className = 'doc-row' + (selectedDocId === d.doc_id ? ' selected' : '');
+                    row.onclick = () => { selectedDocId = d.doc_id; updateDocsHighlight(); };
+                    const fname = document.createElement('span');
+                    fname.className = 'doc-filename';
+                    fname.textContent = d.filename || '(Без названия)';
+                    const docid = document.createElement('span');
+                    docid.className = 'doc-id';
+                    docid.textContent = 'ID: ' + d.doc_id;
+                    const del = document.createElement('span');
+                    del.className = 'doc-delete';
+                    del.textContent = 'удалить';
+                    del.onclick = (e) => {
+                        e.stopPropagation();
+                        if (confirm('Удалить документ?')) {
+                            fetch('/docs/' + d.doc_id, { method: 'DELETE' })
+                                .then(() => { loadDocs(); selectedDocId = null; });
+                        }
+                    };
+                    row.appendChild(fname);
+                    row.appendChild(docid);
+                    row.appendChild(del);
+                    cont.appendChild(row);
+                }
+            });
+    }
+    function updateDocsHighlight() {
+        const rows = document.querySelectorAll('.doc-row');
+        rows.forEach(row => row.classList.remove('selected'));
+        if (selectedDocId) {
+            const match = Array.from(rows).find(r => r.textContent.includes(selectedDocId));
+            if (match) match.classList.add('selected');
+        }
+    }
+    loadDocs();
+
+    // Загрузка файла
+    document.getElementById('upload-btn').onclick = function() {
+        const fileInput = document.getElementById('upload-file');
+        const file = fileInput.files[0];
+        if (!file) {
+            alert('Выберите файл');
+            return;
+        }
+        const fd = new FormData();
+        fd.append('file', file);
+        fetch('/upload', { method: 'POST', body: fd })
+            .then(resp => resp.json())
+            .then(data => {
+                document.getElementById('upload-result').textContent = 'Загружено: ' + file.name + ' (ID: ' + data.doc_id + ')';
+                loadDocs();
+            })
+            .catch(() => { document.getElementById('upload-result').textContent = 'Ошибка загрузки.'; });
+    };
+
+    // Запуск запроса
+    document.getElementById('run-btn').onclick = async function() {
+        document.getElementById('query-result').style.display = 'none';
+        document.getElementById('query-demo').style.display = 'none';
+
+        const attack_file = document.getElementById('attack-file').value || null;
+        const defenses = Array.from(document.querySelectorAll('input[name="defense"]:checked')).map(cb => cb.value);
+        const query = document.getElementById('query').value;
+        const doc_id = selectedDocId || null;
+
+        const payload = {
+            attack_file,
+            defenses,
+            prompt: attack_file ? null : query,
+            doc_id
+        };
+
+        const resp = await fetch('/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+            document.getElementById('query-result').innerText = 'Ошибка: ' + resp.status;
+            document.getElementById('query-result').style.display = '';
+            return;
+        }
+
+        const data = await resp.json();
+        // Основной вывод ответа
+        let mainText = "<strong>Ответ:</strong><br>";
+        if (data.answer_filtered) mainText += `<pre>${highlightPatterns(data.answer_filtered, data.found_exact, data.found_fuzzy)}</pre>`;
+        else if (data.answer_sanitized) mainText += `<pre>${escapeHTML(data.answer_sanitized)}</pre>`;
+        else if (data.answer_raw) mainText += `<pre>${escapeHTML(data.answer_raw)}</pre>`;
+        else mainText += "<pre><em>Пусто</em></pre>";
+
+        document.getElementById('query-result').innerHTML = mainText;
+        document.getElementById('query-result').style.display = '';
+
+        // Пошаговая демонстрация
+        document.getElementById('raw-context').textContent      = data.raw_context || '—';
+        document.getElementById('isolated-context').textContent = data.isolated_context || '—';
+        document.getElementById('answer-raw').textContent       = data.answer_raw || '—';
+        document.getElementById('answer-filtered').innerHTML    = data.answer_filtered
+            ? highlightPatterns(data.answer_filtered, data.found_exact, data.found_fuzzy)
+            : '—';
+        document.getElementById('answer-sanitized').textContent = data.answer_sanitized || '—';
+
+        // Флаги
+        const flagsEl = document.getElementById('flags-list');
+        flagsEl.innerHTML = '';
+        if (data.flags && Object.keys(data.flags).length) {
+            for (const [key, val] of Object.entries(data.flags)) {
+                const li = document.createElement('li');
+                li.textContent = `${key}: ${val}`;
+                li.className = (val === true || val === 'ok') ? 'flag-ok' : (val ? 'flag-bad' : '');
+                flagsEl.appendChild(li);
+            }
+        } else {
+            const li = document.createElement('li');
+            li.textContent = '—';
+            flagsEl.appendChild(li);
+        }
+
+        document.getElementById('found-exact').textContent = (data.found_exact && data.found_exact.length)
+            ? data.found_exact.join(', ')
+            : '—';
+        document.getElementById('found-fuzzy').textContent = (data.found_fuzzy && data.found_fuzzy.length)
+            ? data.found_fuzzy.join(', ')
+            : '—';
+
+        document.getElementById('obfuscation-flags').innerHTML = '<em>—</em>'; // для совместимости
+
+        document.getElementById('query-demo').style.display = '';
+    };
+
+    // Вспомогательные функции
+    function escapeHTML(str) {
+        if (!str) return '';
+        return str.replace(/[<>&"]/g, function(c) {
+            return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];
+        });
+    }
+    function highlightPatterns(text, exact, fuzzy) {
+        if (!text) return '';
+        let safe = escapeHTML(text);
+        let allPatterns = [].concat(exact||[], fuzzy||[]);
+        allPatterns = Array.from(new Set(allPatterns)).sort((a,b) => b.length - a.length);
+        for (const pat of allPatterns) {
+            if (!pat) continue;
+            const re = new RegExp(escapeRegExp(pat), 'gi');
+            safe = safe.replace(re, m => `<mark>${m}</mark>`);
+        }
+        return safe;
+    }
+    function escapeRegExp(string) {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    </script>
+</body>
+</html>
